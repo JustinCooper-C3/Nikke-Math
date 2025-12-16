@@ -17,6 +17,6 @@ REM Install/update dependencies
 echo Checking dependencies...
 pip install -r requirements.txt --quiet
 
-REM Run the application with debug mode enabled
-python main.py --debug
+REM Run the application
+python main.py
 pause
