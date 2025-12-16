@@ -1,8 +1,13 @@
 """
-Solution Manager Module - UI state machine for single-move solution flow.
+Solution Manager Module - UI state machine for cached solution flow.
 
 This module provides the SolutionManager which handles the UI-level
-state machine for displaying one move at a time and validating clears.
+state machine for displaying moves from a cached solution and validating clears.
+
+Uses tiered validation:
+  - Tier 1 (Fast): Check if expected cells cleared
+  - Tier 2 (Stability): Wait for stable frames to filter flutter
+  - Tier 3 (Full): Compare board against expected state
 
 For the core solving logic, see the src.solver package.
 """
@@ -11,7 +16,10 @@ from enum import Enum, auto
 from typing import List, Tuple, Optional, Set
 import logging
 
-from src.solver import BoardState, Move, SolverStrategy, create_strategy
+from src.solver import (
+    BoardState, Move, Solution, CachedSolution,
+    SolverStrategy, SolutionContext, create_strategy
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,37 +32,41 @@ __all__ = [
 
 class SolutionState(Enum):
     """
-    State machine states for single-move solution flow.
+    State machine states for cached solution flow.
 
     States:
         WAITING_STABLE: Collecting frames to establish stable board
-        COMPUTING_MOVE: Finding the best next move
+        COMPUTING_SOLUTION: Computing full solution (all moves)
         MOVE_DISPLAYED: Move is shown, waiting for user to execute
         VALIDATING_CLEAR: Checking if expected cells were cleared
     """
     WAITING_STABLE = auto()
-    COMPUTING_MOVE = auto()
+    COMPUTING_SOLUTION = auto()
     MOVE_DISPLAYED = auto()
     VALIDATING_CLEAR = auto()
 
 
 class SolutionManager:
     """
-    Single-move-at-a-time solution manager with clear validation.
+    Cached solution manager with tiered validation.
 
     Implements a state machine that:
     1. Waits for stable board (3 consecutive identical frames)
-    2. Computes ONE best move using the selected strategy
-    3. Displays move and tracks expected cells to clear
-    4. Validates that cells were cleared before computing next move
-    5. Handles timeouts and unexpected board changes
+    2. Computes FULL solution using the selected strategy
+    3. Displays moves one at a time from cache
+    4. Validates clears using tiered approach (fast/stability/full)
+    5. Only recomputes when board diverges from expected state
 
     State Flow:
-        WAITING_STABLE -> COMPUTING_MOVE -> MOVE_DISPLAYED -> VALIDATING_CLEAR
-                ^                                                    |
-                |____________________________________________________|
-                    (cells cleared OR timeout OR unexpected change)
+        WAITING_STABLE -> COMPUTING_SOLUTION -> MOVE_DISPLAYED -> VALIDATING_CLEAR
+                ^                                      |                |
+                |                                      +-- (pop next) --+
+                |______________________________________________________|
+                    (cache invalid OR exhausted OR timeout)
     """
+
+    # Cache timeout in seconds (recompute if cache older than this)
+    CACHE_TIMEOUT_SEC = 30.0
 
     def __init__(self, stability_threshold: int = 3, timeout_frames: int = 30,
                  strategy_name: str = "greedy"):
@@ -82,7 +94,10 @@ class SolutionManager:
         self._current_board: Optional[BoardState] = None
         self._last_stable_board: Optional[BoardState] = None
 
-        # Current move tracking
+        # Cached solution (full solution with move queue)
+        self._cached_solution: Optional[CachedSolution] = None
+
+        # Current move tracking (for backward compatibility)
         self._current_move: Optional[Move] = None
         self._expected_cleared: Set[Tuple[int, int]] = set()
         self._frames_since_display: int = 0
@@ -140,6 +155,45 @@ class SolutionManager:
         """Get cells that disagreed across recent frames."""
         return self._unstable_cells.copy()
 
+    @property
+    def cached_solution(self) -> Optional[CachedSolution]:
+        """Get current cached solution."""
+        return self._cached_solution
+
+    @property
+    def moves_remaining(self) -> int:
+        """Number of moves remaining in cached solution."""
+        if self._cached_solution is None:
+            return 0
+        return self._cached_solution.moves_remaining
+
+    @property
+    def total_moves(self) -> int:
+        """Total moves in current solution."""
+        if self._cached_solution is None:
+            return 0
+        return self._cached_solution.total_moves
+
+    def peek_next_moves(self, count: int = 3) -> List[Move]:
+        """
+        Preview upcoming moves without advancing.
+
+        Args:
+            count: Number of moves to preview
+
+        Returns:
+            List of upcoming moves
+        """
+        if self._cached_solution is None:
+            return []
+        return self._cached_solution.peek_moves(count)
+
+    def invalidate_cache(self) -> None:
+        """Force cache invalidation and trigger recomputation."""
+        logger.info("Cache invalidated manually")
+        self._cached_solution = None
+        self._transition_to_waiting_stable()
+
     def update(self, board: BoardState) -> bool:
         """
         Update with new board state and process state machine.
@@ -154,8 +208,8 @@ class SolutionManager:
 
         if self._state == SolutionState.WAITING_STABLE:
             return self._handle_waiting_stable(board)
-        elif self._state == SolutionState.COMPUTING_MOVE:
-            return self._handle_computing_move(board)
+        elif self._state == SolutionState.COMPUTING_SOLUTION:
+            return self._handle_computing_solution(board)
         elif self._state == SolutionState.MOVE_DISPLAYED:
             return self._handle_move_displayed(board)
         elif self._state == SolutionState.VALIDATING_CLEAR:
@@ -185,47 +239,58 @@ class SolutionManager:
         self._unstable_cells = set()
         self._last_stable_board = first_board
 
-        logger.info("State[WAITING_STABLE]: board stable, transitioning to COMPUTING_MOVE")
-        self._state = SolutionState.COMPUTING_MOVE
-        return self._handle_computing_move(board)
+        logger.info("State[WAITING_STABLE]: board stable, transitioning to COMPUTING_SOLUTION")
+        self._state = SolutionState.COMPUTING_SOLUTION
+        return self._handle_computing_solution(board)
 
-    def _handle_computing_move(self, board: BoardState) -> bool:
-        """Handle COMPUTING_MOVE state - find best next move."""
+    def _handle_computing_solution(self, board: BoardState) -> bool:
+        """Handle COMPUTING_SOLUTION state - compute full solution and cache it."""
         import time
 
         if self._last_stable_board is None:
-            logger.warning("State[COMPUTING_MOVE]: no stable board, returning to WAITING_STABLE")
+            logger.warning("State[COMPUTING_SOLUTION]: no stable board, returning to WAITING_STABLE")
             self._state = SolutionState.WAITING_STABLE
             return False
 
         start_time = time.perf_counter()
 
-        # Use strategy to find best move
-        best_move = self._strategy.find_best_move(self._last_stable_board)
+        # Create context and compute full solution
+        context = SolutionContext(
+            board=self._last_stable_board,
+            timeout_sec=self._strategy.timeout_sec
+        )
+        solution = self._strategy.solve(context)
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
 
-        if best_move is None:
-            logger.info(f"State[COMPUTING_MOVE]: no valid moves found ({elapsed_ms:.1f}ms)")
+        if not solution.has_moves:
+            logger.info(f"State[COMPUTING_SOLUTION]: no valid moves found ({elapsed_ms:.1f}ms)")
+            self._cached_solution = None
             self._current_move = None
             self._expected_cleared = set()
             self._state = SolutionState.WAITING_STABLE
             self._frame_buffer.clear()
             return False
 
-        logger.info(f"State[COMPUTING_MOVE]: found move clearing {best_move.cell_count} cells ({elapsed_ms:.1f}ms)")
+        # Cache the full solution
+        self._cached_solution = CachedSolution(solution=solution)
 
-        self._current_move = best_move
-        self._expected_cleared = set(best_move.cells)
-        self._frames_since_display = 0
+        logger.info(
+            f"State[COMPUTING_SOLUTION]: computed {solution.move_count} moves, "
+            f"{solution.total_cleared} total cells ({elapsed_ms:.1f}ms)"
+        )
 
-        self._state = SolutionState.MOVE_DISPLAYED
-        logger.info(f"State[COMPUTING_MOVE]: transitioning to MOVE_DISPLAYED, expecting {len(self._expected_cleared)} cells to clear")
-
-        return True
+        # Set up first move for display
+        return self._display_current_move()
 
     def _handle_move_displayed(self, board: BoardState) -> bool:
         """Handle MOVE_DISPLAYED state - wait for board change."""
+        # Check for cache timeout (stale solution)
+        if self._cached_solution is not None:
+            if self._cached_solution.age_seconds > self.CACHE_TIMEOUT_SEC:
+                logger.warning(f"State[MOVE_DISPLAYED]: cache expired ({self._cached_solution.age_seconds:.1f}s), recomputing")
+                return self._invalidate_and_recompute(board)
+
         if self._last_stable_board is not None and board != self._last_stable_board:
             logger.info("State[MOVE_DISPLAYED]: board changed, transitioning to VALIDATING_CLEAR")
             self._state = SolutionState.VALIDATING_CLEAR
@@ -236,20 +301,34 @@ class SolutionManager:
 
         if self._frames_since_display >= self.timeout_frames:
             logger.warning(f"State[MOVE_DISPLAYED]: timeout after {self._frames_since_display} frames, recalculating")
+            self._cached_solution = None  # Clear stale cache
             self._transition_to_waiting_stable()
             return False
 
         return True
 
     def _handle_validating_clear(self, board: BoardState) -> bool:
-        """Handle VALIDATING_CLEAR state - check if expected cells cleared."""
+        """
+        Handle VALIDATING_CLEAR state - tiered validation of cell clearing.
+
+        Tier 1 (Fast): Check if expected cells cleared immediately
+        Tier 2 (Stability): Wait for stable frames to filter flutter
+        Tier 3 (Full): Compare stable board against expected state
+        """
+        # Tier 1: Fast-path check - did expected cells clear?
+        if self._cached_solution is not None:
+            if self._cached_solution.validate_cells_cleared(board):
+                logger.info("State[VALIDATING_CLEAR]: Tier 1 PASS - expected cells cleared")
+                return self._advance_to_next_move(board)
+
+        # Tier 2: Wait for stability (filter flutter)
         self._frame_buffer.append(board)
 
         if len(self._frame_buffer) > self.stability_threshold:
             self._frame_buffer.pop(0)
 
         if len(self._frame_buffer) < self.stability_threshold:
-            logger.debug(f"State[VALIDATING_CLEAR]: waiting for stability ({len(self._frame_buffer)}/{self.stability_threshold})")
+            logger.debug(f"State[VALIDATING_CLEAR]: Tier 2 - waiting for stability ({len(self._frame_buffer)}/{self.stability_threshold})")
             return self._current_move is not None
 
         first_board = self._frame_buffer[0]
@@ -257,42 +336,43 @@ class SolutionManager:
 
         if not all_same:
             self._unstable_cells = self._find_unstable_cells()
-            logger.debug(f"State[VALIDATING_CLEAR]: still stabilizing, {len(self._unstable_cells)} unstable cells")
+            logger.debug(f"State[VALIDATING_CLEAR]: Tier 2 - still stabilizing, {len(self._unstable_cells)} unstable cells")
             return self._current_move is not None
 
         self._unstable_cells = set()
 
+        # Tier 3: Full board comparison (with unstable cell filtering)
+        if self._cached_solution is not None:
+            if self._cached_solution.validate_board_match(first_board, self._unstable_cells):
+                logger.info("State[VALIDATING_CLEAR]: Tier 3 PASS - board matches expected")
+                return self._advance_to_next_move(first_board)
+
+        # Tier 3 failed - check what happened
         cells_cleared = set()
         for r, c in self._expected_cleared:
-            if first_board.get_cell(r, c) is None:
+            cell_value = first_board.get_cell(r, c)
+            if cell_value is None or cell_value == 0:
                 cells_cleared.add((r, c))
 
         if cells_cleared == self._expected_cleared:
-            logger.info(f"State[VALIDATING_CLEAR]: all {len(cells_cleared)} expected cells cleared, computing next move")
-            self._last_stable_board = first_board
-            self._current_move = None
-            self._expected_cleared = set()
-            self._state = SolutionState.COMPUTING_MOVE
-            return self._handle_computing_move(first_board)
+            # Cells cleared but board doesn't match expected (user did extra moves?)
+            logger.info(f"State[VALIDATING_CLEAR]: cells cleared but board differs from expected, invalidating cache")
+            return self._invalidate_and_recompute(first_board)
 
         elif len(cells_cleared) > 0:
-            logger.info(f"State[VALIDATING_CLEAR]: {len(cells_cleared)}/{len(self._expected_cleared)} cells cleared (partial/different), accepting new state")
-            self._last_stable_board = first_board
-            self._current_move = None
-            self._expected_cleared = set()
-            self._state = SolutionState.COMPUTING_MOVE
-            return self._handle_computing_move(first_board)
+            # Partial clear or different cells cleared
+            logger.info(f"State[VALIDATING_CLEAR]: {len(cells_cleared)}/{len(self._expected_cleared)} cells cleared (unexpected), invalidating cache")
+            return self._invalidate_and_recompute(first_board)
 
         else:
+            # No expected cells cleared
             if first_board != self._last_stable_board:
-                logger.info("State[VALIDATING_CLEAR]: board changed but no expected cells cleared, accepting new state")
-                self._last_stable_board = first_board
-                self._current_move = None
-                self._expected_cleared = set()
-                self._state = SolutionState.COMPUTING_MOVE
-                return self._handle_computing_move(first_board)
+                # Board changed but not as expected - invalidate
+                logger.info("State[VALIDATING_CLEAR]: board changed unexpectedly, invalidating cache")
+                return self._invalidate_and_recompute(first_board)
             else:
-                logger.debug("State[VALIDATING_CLEAR]: no change detected, continuing to wait")
+                # Board unchanged - go back to displaying move
+                logger.debug("State[VALIDATING_CLEAR]: no change detected, returning to MOVE_DISPLAYED")
                 self._state = SolutionState.MOVE_DISPLAYED
                 return True
 
@@ -303,6 +383,71 @@ class SolutionManager:
         self._current_move = None
         self._expected_cleared = set()
         self._frames_since_display = 0
+
+    def _display_current_move(self) -> bool:
+        """
+        Set up current move from cache for display.
+
+        Returns:
+            True if a move is ready to display, False if cache exhausted
+        """
+        if self._cached_solution is None or self._cached_solution.is_exhausted:
+            logger.info("Cache exhausted, no more moves")
+            self._current_move = None
+            self._expected_cleared = set()
+            self._transition_to_waiting_stable()
+            return False
+
+        move = self._cached_solution.current_move
+        self._current_move = move
+        self._expected_cleared = self._cached_solution.expected_cells_to_clear
+        self._frames_since_display = 0
+
+        self._state = SolutionState.MOVE_DISPLAYED
+
+        remaining = self._cached_solution.moves_remaining
+        total = self._cached_solution.total_moves
+        logger.info(
+            f"Displaying move {total - remaining + 1}/{total}: "
+            f"clearing {move.cell_count} cells"
+        )
+
+        return True
+
+    def _advance_to_next_move(self, new_board: BoardState) -> bool:
+        """
+        Advance cache to next move after successful validation.
+
+        Args:
+            new_board: The validated stable board state
+
+        Returns:
+            True if next move is ready, False if solution complete
+        """
+        self._last_stable_board = new_board
+        self._frame_buffer.clear()
+
+        if self._cached_solution is not None:
+            self._cached_solution.advance()
+
+        return self._display_current_move()
+
+    def _invalidate_and_recompute(self, new_board: BoardState) -> bool:
+        """
+        Invalidate cache and recompute solution from current board.
+
+        Args:
+            new_board: The current board state to solve from
+
+        Returns:
+            True if new move ready, False otherwise
+        """
+        logger.info("Cache invalidated, recomputing solution")
+        self._cached_solution = None
+        self._last_stable_board = new_board
+        self._frame_buffer.clear()
+        self._state = SolutionState.COMPUTING_SOLUTION
+        return self._handle_computing_solution(new_board)
 
     def _find_unstable_cells(self) -> Set[Tuple[int, int]]:
         """Find cells that have different values across frames in buffer."""
@@ -341,6 +486,7 @@ class SolutionManager:
         self._frame_buffer = []
         self._current_board = None
         self._last_stable_board = None
+        self._cached_solution = None
         self._current_move = None
         self._expected_cleared = set()
         self._frames_since_display = 0
@@ -351,8 +497,17 @@ class SolutionManager:
         """Get human-readable state string for UI display."""
         state_strings = {
             SolutionState.WAITING_STABLE: "Stabilizing",
-            SolutionState.COMPUTING_MOVE: "Computing",
+            SolutionState.COMPUTING_SOLUTION: "Computing",
             SolutionState.MOVE_DISPLAYED: "Move Ready",
             SolutionState.VALIDATING_CLEAR: "Validating"
         }
-        return state_strings.get(self._state, "Unknown")
+        base = state_strings.get(self._state, "Unknown")
+
+        # Add move progress if available
+        if self._cached_solution is not None and not self._cached_solution.is_exhausted:
+            remaining = self._cached_solution.moves_remaining
+            total = self._cached_solution.total_moves
+            current = total - remaining + 1
+            return f"{base} ({current}/{total})"
+
+        return base

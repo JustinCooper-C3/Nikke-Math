@@ -36,7 +36,7 @@ Usage:
 # Core data structures
 from .board import BoardState
 from .move import Move
-from .solution import Solution, SolutionMetrics
+from .solution import Solution, SolutionMetrics, CachedSolution
 from .context import SolutionContext
 
 # Strategy framework
@@ -58,6 +58,7 @@ __all__ = [
     "Move",
     "Solution",
     "SolutionMetrics",
+    "CachedSolution",
     "SolutionContext",
     # Strategy framework
     "SolverStrategy",

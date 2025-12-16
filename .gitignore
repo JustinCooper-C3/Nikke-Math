@@ -48,6 +48,9 @@ tesseract_training/
 # Config with secrets
 config.local.yaml
 
+# User settings (persisted locally)
+config.json
+
 # Logs
 *.log
 solver.log

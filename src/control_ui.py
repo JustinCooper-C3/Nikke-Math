@@ -7,7 +7,7 @@ Includes start/stop controls, status display, and worker thread communication si
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QLabel, QPushButton, QHBoxLayout,
-    QComboBox
+    QComboBox, QCheckBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -30,6 +30,7 @@ class ControlWindow(QMainWindow):
     shutdown_requested = pyqtSignal()
     debug_requested = pyqtSignal()  # Request debug image save
     strategy_changed = pyqtSignal(str)  # Emits strategy name when changed
+    debug_toggled = pyqtSignal(bool)  # Emits when debug checkbox toggled
 
     def __init__(self):
         super().__init__()
@@ -75,6 +76,12 @@ class ControlWindow(QMainWindow):
         self.strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
         strategy_layout.addWidget(self.strategy_combo, 1)  # stretch factor 1
         layout.addLayout(strategy_layout)
+
+        # Debug checkbox
+        self.debug_checkbox = QCheckBox("Save Debug Screenshots")
+        self.debug_checkbox.setFont(QFont("", 9))
+        self.debug_checkbox.stateChanged.connect(self._on_debug_toggled)
+        layout.addWidget(self.debug_checkbox)
 
         # Spacing
         layout.addSpacing(5)
@@ -172,6 +179,20 @@ class ControlWindow(QMainWindow):
         strategy_name = self.strategy_combo.itemData(index)
         if strategy_name:
             self.strategy_changed.emit(strategy_name)
+
+    def _on_debug_toggled(self, state: int):
+        """Handle debug checkbox toggle."""
+        enabled = state == Qt.Checked
+        self.debug_toggled.emit(enabled)
+
+    def set_debug_enabled(self, enabled: bool):
+        """
+        Set the debug checkbox state programmatically.
+
+        Args:
+            enabled: True to check the checkbox, False to uncheck
+        """
+        self.debug_checkbox.setChecked(enabled)
 
     def set_status(self, status: str):
         """

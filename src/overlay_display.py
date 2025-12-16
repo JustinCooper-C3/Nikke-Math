@@ -287,6 +287,16 @@ class OverlayManager(QObject):
         # Connect internal signal for thread-safe updates
         self._update_signal.connect(self._on_update)
 
+    def set_debug_mode(self, enabled: bool):
+        """
+        Enable or disable debug screenshot mode at runtime.
+
+        Args:
+            enabled: True to enable debug screenshots, False to disable
+        """
+        self._debug_mode = enabled
+        logger.info(f"Debug mode {'enabled' if enabled else 'disabled'}")
+
     def start(self) -> bool:
         """
         Start the overlay.
