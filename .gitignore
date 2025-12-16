@@ -1,0 +1,59 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific - images
+*.png
+*.jpg
+*.jpeg
+!assets/templates/*.png
+
+# Test/development images
+assets/test_images/
+test_images/
+input_images/
+
+# Debug output (regenerated at runtime)
+debug/
+
+# Tesseract training (large binary files)
+tesseract_training/
+*.traineddata
+*.checkpoint
+*.lstmf
+*.lstm
+
+# Config with secrets
+config.local.yaml
+
+# Logs
+*.log
+solver.log
+
+# Accidental file artifacts
+=*
+nul
+
+start-claude-root.bat
