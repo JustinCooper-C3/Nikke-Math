@@ -41,7 +41,7 @@ class ControlWindow(QMainWindow):
         """Initialize the user interface components."""
         # Window configuration
         self.setWindowTitle("Nikke Math Solver")
-        self.setFixedSize(320, 360)  # Increased height for new labels
+        self.setFixedSize(320, 380)  # Increased height for score label
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
         # Central widget and layout
@@ -105,13 +105,15 @@ class ControlWindow(QMainWindow):
         self.ocr_label = QLabel("OCR:    --")
         self.cells_label = QLabel("Cells:  --")
         self.fps_label = QLabel("FPS:    --")
-        self.moves_label = QLabel("Moves:  --")
+        self.moves_label = QLabel("Moves:  -- | Status: --")
+        self.score_label = QLabel("Score:  --")
 
         info_font = QFont()
         info_font.setPointSize(9)
 
         for label in [self.window_label, self.board_label, self.ocr_label,
-                      self.cells_label, self.fps_label, self.moves_label]:
+                      self.cells_label, self.fps_label, self.moves_label,
+                      self.score_label]:
             label.setFont(info_font)
             layout.addWidget(label)
 
@@ -229,14 +231,28 @@ class ControlWindow(QMainWindow):
         """
         self.board_label.setText(f"Board:  {info}")
 
-    def set_moves_info(self, info: str):
+    def set_moves_info(self, total_moves: int, status: str, total_cells: int):
         """
-        Update the moves count label.
+        Update the moves and score labels.
 
         Args:
-            info: Moves count information
+            total_moves: Total moves in solution (0 for no solution)
+            status: Current status string (e.g., "Ready (5 cells)")
+            total_cells: Total cells to be cleared (0 for no solution)
         """
-        self.moves_label.setText(f"Moves:  {info}")
+        # Format moves label: "Moves: 12 total | Status: Ready (5 cells)"
+        if total_moves > 0:
+            moves_str = f"{total_moves} total"
+        else:
+            moves_str = "--"
+        self.moves_label.setText(f"Moves:  {moves_str} | Status: {status}")
+
+        # Format score label: "Score: 85,000 (85 cells)"
+        if total_cells > 0:
+            score = total_cells * 1000
+            self.score_label.setText(f"Score:  {score:,} ({total_cells} cells)")
+        else:
+            self.score_label.setText("Score:  --")
 
     def set_ocr_info(self, confidence: float):
         """
@@ -330,6 +346,8 @@ class ControlWindow(QMainWindow):
             self.set_ocr_info(0)
             self.set_cells_info(0, 0)
             self.fps_label.setText("FPS:    --")
+            self.moves_label.setText("Moves:  -- | Status: --")
+            self.score_label.setText("Score:  --")
 
     def closeEvent(self, event):
         """

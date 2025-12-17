@@ -116,12 +116,13 @@ class BoardState:
         Count non-empty cells on the board.
 
         Returns:
-            Number of cells with values (not None)
+            Number of cells with values (not None and not 0)
+            Note: OCR returns 0 for empty cells, so both None and 0 are excluded
         """
         count = 0
         for row in self.grid:
             for cell in row:
-                if cell is not None:
+                if cell is not None and cell != 0:
                     count += 1
         return count
 

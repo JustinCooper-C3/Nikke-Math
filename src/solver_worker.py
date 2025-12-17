@@ -57,7 +57,7 @@ class SolverWorker(QThread):
     status_changed = pyqtSignal(str)
     window_changed = pyqtSignal(str)
     board_changed = pyqtSignal(str)
-    moves_changed = pyqtSignal(str)
+    moves_changed = pyqtSignal(int, str, int)  # (total_moves, status, total_cells)
     error_occurred = pyqtSignal(str)
     next_move_ready = pyqtSignal(object)  # Emits Move or None
 
@@ -165,7 +165,7 @@ class SolverWorker(QThread):
             else:
                 self.window_changed.emit("Not detected")
                 self.board_changed.emit("--")
-                self.moves_changed.emit("--")
+                self.moves_changed.emit(0, "--", 0)
                 self.ocr_status.emit(0.0, 0, 0)
                 return
 
@@ -176,7 +176,7 @@ class SolverWorker(QThread):
             self._cached_window_rect = None
             self.window_changed.emit("Window lost - searching...")
             self.board_changed.emit("--")
-            self.moves_changed.emit("--")
+            self.moves_changed.emit(0, "--", 0)
             self.ocr_status.emit(0.0, 0, 0)
             return
 
@@ -260,13 +260,16 @@ class SolverWorker(QThread):
                     expected_count = len(self._solution_manager.expected_cleared)
 
                     if current_state == SolutionState.MOVE_DISPLAYED:
-                        status = f"Move ready ({next_move.cell_count} cells)"
+                        status = f"Ready ({next_move.cell_count} cells)"
                     elif current_state == SolutionState.VALIDATING_CLEAR:
                         status = f"Validating ({expected_count} cells)"
                     else:
                         status = f"{state_str}"
 
-                    self.moves_changed.emit(status)
+                    # Emit solution stats: total_moves, status, total_cells
+                    total_moves = self._solution_manager.total_moves
+                    total_cells = self._solution_manager.total_cleared
+                    self.moves_changed.emit(total_moves, status, total_cells)
                 else:
                     # No move to display
                     self._last_overlay_move = None
@@ -275,17 +278,17 @@ class SolverWorker(QThread):
 
                     # Status based on state
                     if current_state == SolutionState.WAITING_STABLE:
-                        self.moves_changed.emit("Stabilizing...")
+                        self.moves_changed.emit(0, "Stabilizing...", 0)
                     elif current_state == SolutionState.COMPUTING_MOVE:
-                        self.moves_changed.emit("Computing...")
+                        self.moves_changed.emit(0, "Computing...", 0)
                     else:
-                        self.moves_changed.emit("No valid moves")
+                        self.moves_changed.emit(0, "No valid moves", 0)
             else:
                 self._last_grid_info = None
                 self._last_ocr_result = None
                 self.board_changed.emit("Grid not detected")
                 self.ocr_status.emit(0.0, 0, 0)
-                self.moves_changed.emit("--")
+                self.moves_changed.emit(0, "--", 0)
                 self.overlay_update.emit(None, None, None, None, None, None)
         else:
             self.board_changed.emit("Capture failed")

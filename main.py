@@ -167,7 +167,7 @@ class Application:
         self.window.set_running(False)
         self.window.set_window_info("Not detected")
         self.window.set_board_info("--")
-        self.window.set_moves_info("--")
+        self.window.set_moves_info(0, "--", 0)
 
     def _on_shutdown(self):
         """Handle window close."""

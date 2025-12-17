@@ -4,10 +4,11 @@ Solution Manager Module - UI state machine for cached solution flow.
 This module provides the SolutionManager which handles the UI-level
 state machine for displaying moves from a cached solution and validating clears.
 
-Uses tiered validation:
-  - Tier 1 (Fast): Check if expected cells cleared
-  - Tier 2 (Stability): Wait for stable frames to filter flutter
-  - Tier 3 (Full): Compare board against expected state
+Simplified validation:
+  - Only monitors expected cells (ignores other board changes)
+  - Requires 3 stable frames with expected cells = 0
+  - Never invalidates cache - trusts solution until exhausted
+  - Immediately recomputes when cache exhausts
 
 For the core solving logic, see the src.solver package.
 """
@@ -48,21 +49,27 @@ class SolutionState(Enum):
 
 class SolutionManager:
     """
-    Cached solution manager with tiered validation.
+    Cached solution manager with simplified validation.
 
     Implements a state machine that:
     1. Waits for stable board (3 consecutive identical frames)
     2. Computes FULL solution using the selected strategy
     3. Displays moves one at a time from cache
-    4. Validates clears using tiered approach (fast/stability/full)
-    5. Only recomputes when board diverges from expected state
+    4. Only checks if expected cells are zero (ignores other changes)
+    5. Requires 3 stable frames before advancing
+    6. Immediately recomputes when cache exhausts
 
     State Flow:
-        WAITING_STABLE -> COMPUTING_SOLUTION -> MOVE_DISPLAYED -> VALIDATING_CLEAR
-                ^                                      |                |
-                |                                      +-- (pop next) --+
-                |______________________________________________________|
-                    (cache invalid OR exhausted OR timeout)
+        WAITING_STABLE -> COMPUTING_SOLUTION -> MOVE_DISPLAYED
+                ^                                     |
+                |                          expected cells = 0?
+                |                                     |
+                |                            VALIDATING_CLEAR
+                |                                     |
+                |                            3 stable frames?
+                |                                     |
+                |                              advance/recompute
+                |___________________________________________|
     """
 
     # Cache timeout in seconds (recompute if cache older than this)
@@ -174,6 +181,13 @@ class SolutionManager:
             return 0
         return self._cached_solution.total_moves
 
+    @property
+    def total_cleared(self) -> int:
+        """Total cells cleared by current solution."""
+        if self._cached_solution is None:
+            return 0
+        return self._cached_solution.solution.total_cleared
+
     def peek_next_moves(self, count: int = 3) -> List[Move]:
         """
         Preview upcoming moves without advancing.
@@ -192,7 +206,10 @@ class SolutionManager:
         """Force cache invalidation and trigger recomputation."""
         logger.info("Cache invalidated manually")
         self._cached_solution = None
-        self._transition_to_waiting_stable()
+        if self._current_board is not None:
+            self._recompute_solution(self._current_board)
+        else:
+            self._transition_to_waiting_stable()
 
     def update(self, board: BoardState) -> bool:
         """
@@ -284,97 +301,69 @@ class SolutionManager:
         return self._display_current_move()
 
     def _handle_move_displayed(self, board: BoardState) -> bool:
-        """Handle MOVE_DISPLAYED state - wait for board change."""
+        """
+        Handle MOVE_DISPLAYED state - wait for expected cells to clear.
+
+        Only monitors the cells we expect to be cleared by current move.
+        Ignores all other board changes (selection highlighting, OCR noise, etc.)
+        """
         # Check for cache timeout (stale solution)
         if self._cached_solution is not None:
             if self._cached_solution.age_seconds > self.CACHE_TIMEOUT_SEC:
                 logger.warning(f"State[MOVE_DISPLAYED]: cache expired ({self._cached_solution.age_seconds:.1f}s), recomputing")
-                return self._invalidate_and_recompute(board)
+                return self._recompute_solution(board)
 
-        if self._last_stable_board is not None and board != self._last_stable_board:
-            logger.info("State[MOVE_DISPLAYED]: board changed, transitioning to VALIDATING_CLEAR")
+        # Only check if expected cells are now zero - ignore everything else
+        if self._expected_cells_are_zero(board):
+            logger.info("State[MOVE_DISPLAYED]: expected cells cleared, transitioning to VALIDATING_CLEAR")
             self._state = SolutionState.VALIDATING_CLEAR
             self._frame_buffer.clear()
-            return self._handle_validating_clear(board)
+            self._frame_buffer.append(board)  # Start stability count
+            return self._current_move is not None
 
         self._frames_since_display += 1
 
         if self._frames_since_display >= self.timeout_frames:
-            logger.warning(f"State[MOVE_DISPLAYED]: timeout after {self._frames_since_display} frames, recalculating")
-            self._cached_solution = None  # Clear stale cache
-            self._transition_to_waiting_stable()
-            return False
+            logger.warning(f"State[MOVE_DISPLAYED]: timeout after {self._frames_since_display} frames, recomputing")
+            return self._recompute_solution(board)
 
         return True
 
     def _handle_validating_clear(self, board: BoardState) -> bool:
         """
-        Handle VALIDATING_CLEAR state - tiered validation of cell clearing.
+        Handle VALIDATING_CLEAR state - wait for stable confirmation of cleared cells.
 
-        Tier 1 (Fast): Check if expected cells cleared immediately
-        Tier 2 (Stability): Wait for stable frames to filter flutter
-        Tier 3 (Full): Compare stable board against expected state
+        Requires 3 consecutive frames where expected cells are zero before advancing.
+        This filters out transient OCR noise during cell clearing animation.
         """
-        # Tier 1: Fast-path check - did expected cells clear?
-        if self._cached_solution is not None:
-            if self._cached_solution.validate_cells_cleared(board):
-                logger.info("State[VALIDATING_CLEAR]: Tier 1 PASS - expected cells cleared")
-                return self._advance_to_next_move(board)
+        # Check if expected cells are still zero
+        if not self._expected_cells_are_zero(board):
+            # Cells came back (OCR noise during animation) - return to MOVE_DISPLAYED
+            logger.debug("State[VALIDATING_CLEAR]: expected cells not zero, returning to MOVE_DISPLAYED")
+            self._state = SolutionState.MOVE_DISPLAYED
+            self._frame_buffer.clear()
+            return True
 
-        # Tier 2: Wait for stability (filter flutter)
+        # Add to stability buffer
         self._frame_buffer.append(board)
 
         if len(self._frame_buffer) > self.stability_threshold:
             self._frame_buffer.pop(0)
 
         if len(self._frame_buffer) < self.stability_threshold:
-            logger.debug(f"State[VALIDATING_CLEAR]: Tier 2 - waiting for stability ({len(self._frame_buffer)}/{self.stability_threshold})")
+            logger.debug(f"State[VALIDATING_CLEAR]: waiting for stability ({len(self._frame_buffer)}/{self.stability_threshold})")
             return self._current_move is not None
 
-        first_board = self._frame_buffer[0]
-        all_same = all(b == first_board for b in self._frame_buffer)
+        # Check all frames in buffer have expected cells = 0
+        all_cleared = all(self._expected_cells_are_zero(b) for b in self._frame_buffer)
 
-        if not all_same:
-            self._unstable_cells = self._find_unstable_cells()
-            logger.debug(f"State[VALIDATING_CLEAR]: Tier 2 - still stabilizing, {len(self._unstable_cells)} unstable cells")
+        if not all_cleared:
+            logger.debug("State[VALIDATING_CLEAR]: stability check failed, some frames had non-zero expected cells")
             return self._current_move is not None
 
-        self._unstable_cells = set()
-
-        # Tier 3: Full board comparison (with unstable cell filtering)
-        if self._cached_solution is not None:
-            if self._cached_solution.validate_board_match(first_board, self._unstable_cells):
-                logger.info("State[VALIDATING_CLEAR]: Tier 3 PASS - board matches expected")
-                return self._advance_to_next_move(first_board)
-
-        # Tier 3 failed - check what happened
-        cells_cleared = set()
-        for r, c in self._expected_cleared:
-            cell_value = first_board.get_cell(r, c)
-            if cell_value is None or cell_value == 0:
-                cells_cleared.add((r, c))
-
-        if cells_cleared == self._expected_cleared:
-            # Cells cleared but board doesn't match expected (user did extra moves?)
-            logger.info(f"State[VALIDATING_CLEAR]: cells cleared but board differs from expected, invalidating cache")
-            return self._invalidate_and_recompute(first_board)
-
-        elif len(cells_cleared) > 0:
-            # Partial clear or different cells cleared
-            logger.info(f"State[VALIDATING_CLEAR]: {len(cells_cleared)}/{len(self._expected_cleared)} cells cleared (unexpected), invalidating cache")
-            return self._invalidate_and_recompute(first_board)
-
-        else:
-            # No expected cells cleared
-            if first_board != self._last_stable_board:
-                # Board changed but not as expected - invalidate
-                logger.info("State[VALIDATING_CLEAR]: board changed unexpectedly, invalidating cache")
-                return self._invalidate_and_recompute(first_board)
-            else:
-                # Board unchanged - go back to displaying move
-                logger.debug("State[VALIDATING_CLEAR]: no change detected, returning to MOVE_DISPLAYED")
-                self._state = SolutionState.MOVE_DISPLAYED
-                return True
+        # Stable! Expected cells have been zero for 3 consecutive frames
+        logger.info(f"State[VALIDATING_CLEAR]: stable - advancing to next move")
+        return self._advance_to_next_move(board)
 
     def _transition_to_waiting_stable(self) -> None:
         """Helper to transition back to WAITING_STABLE state."""
@@ -388,15 +377,23 @@ class SolutionManager:
         """
         Set up current move from cache for display.
 
+        If cache is exhausted, immediately triggers recomputation from
+        the current board state.
+
         Returns:
-            True if a move is ready to display, False if cache exhausted
+            True if a move is ready to display, False otherwise
         """
         if self._cached_solution is None or self._cached_solution.is_exhausted:
-            logger.info("Cache exhausted, no more moves")
-            self._current_move = None
-            self._expected_cleared = set()
-            self._transition_to_waiting_stable()
-            return False
+            logger.info("Cache exhausted, immediately recomputing from current board")
+            # Use last stable board for recomputation
+            if self._last_stable_board is not None:
+                return self._recompute_solution(self._last_stable_board)
+            else:
+                # No stable board yet, go to waiting
+                self._current_move = None
+                self._expected_cleared = set()
+                self._transition_to_waiting_stable()
+                return False
 
         move = self._cached_solution.current_move
         self._current_move = move
@@ -432,22 +429,41 @@ class SolutionManager:
 
         return self._display_current_move()
 
-    def _invalidate_and_recompute(self, new_board: BoardState) -> bool:
+    def _expected_cells_are_zero(self, board: BoardState) -> bool:
         """
-        Invalidate cache and recompute solution from current board.
+        Check if all expected cells are now zero/empty.
 
         Args:
-            new_board: The current board state to solve from
+            board: Board state to check
+
+        Returns:
+            True if all expected cells are 0 or None
+        """
+        if not self._expected_cleared:
+            return False
+
+        for r, c in self._expected_cleared:
+            cell_value = board.get_cell(r, c)
+            if cell_value is not None and cell_value != 0:
+                return False
+        return True
+
+    def _recompute_solution(self, board: BoardState) -> bool:
+        """
+        Recompute solution from given board state.
+
+        Args:
+            board: The board state to solve from
 
         Returns:
             True if new move ready, False otherwise
         """
-        logger.info("Cache invalidated, recomputing solution")
+        logger.info("Recomputing solution from current board")
         self._cached_solution = None
-        self._last_stable_board = new_board
+        self._last_stable_board = board
         self._frame_buffer.clear()
         self._state = SolutionState.COMPUTING_SOLUTION
-        return self._handle_computing_solution(new_board)
+        return self._handle_computing_solution(board)
 
     def _find_unstable_cells(self) -> Set[Tuple[int, int]]:
         """Find cells that have different values across frames in buffer."""
